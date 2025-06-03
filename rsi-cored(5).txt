@@ -1,0 +1,1120 @@
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <cstdlib>
+#include <chrono>
+#include <random>
+#include <thread>
+#include <string>
+#include <vector>
+#include <map>
+#include <csignal>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <nlohmann/json.hpp>
+#include <sys/inotify.h>
+#include <fcntl.h>
+#include <regex>
+#include <sys/stat.h>
+
+using namespace std;
+namespace fs = std::filesystem;
+using json = nlohmann::json;
+
+// Configuration
+const string BASE_DIR = "/opt/rsi-core";
+const string MODULE_DIR = BASE_DIR + "/modules";
+const string BIN_DIR = BASE_DIR + "/bin";
+const string KNOWLEDGE_DIR = BASE_DIR + "/knowledge";
+const string DRIVER_DIR = BASE_DIR + "/drivers";
+const string MODULES_FILE = BASE_DIR + "/modules.json";
+const string LOG_FILE = BASE_DIR + "/rsi-core.log";
+const string SOCKET_PATH = BASE_DIR + "/rsi-core.sock";
+const string KERNEL_SRC = "/lib/modules/$(uname -r)/source/drivers";
+const int SLEEP_TIME = 15;
+const int MAX_ITERATIONS = 10000;
+const int MAX_MUTATION_ATTEMPTS = 5;
+
+// Logging
+class Logger {
+public:
+    static void log(const string& msg) {
+        ofstream log_file(LOG_FILE, ios::app);
+        auto now = chrono::system_clock::now();
+        time_t tt = chrono::system_clock::to_time_t(now);
+        log_file << "[" << ctime(&tt) << "] " << msg << endl;
+        cout << "[RSI-Core] " << msg << endl;
+    }
+};
+
+// Notifications
+class Notifications {
+public:
+    static void notify(const string& msg) {
+        Logger::log("[Notification] " + msg);
+        system(("notify-send 'RSI-Core' '" + msg + "' 2>/dev/null").c_str());
+    }
+};
+
+// Compiler
+class Compiler {
+public:
+    static bool compile(const string& module_id, const string& code, bool is_driver = false) {
+        string src_path = (is_driver ? DRIVER_DIR : MODULE_DIR) + "/" + module_id + ".c";
+        string bin_path = (is_driver ? DRIVER_DIR : BIN_DIR) + "/" + module_id + (is_driver ? ".ko" : "");
+        ofstream src_file(src_path);
+        src_file << code;
+        src_file.close();
+        string cmd = is_driver ?
+            "make -C /lib/modules/$(uname -r)/build M=$(pwd)/" + DRIVER_DIR + " modules 2>&1 | tee /tmp/rsi_compile_log_" + module_id :
+            "g++ " + src_path + " -o " + bin_path + " 2>&1";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        string errors;
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            errors += buffer;
+        }
+        int status = pclose(pipe);
+        if (status == 0) {
+            if (!is_driver) chmod(bin_path.c_str(), 0755);
+            return true;
+        }
+        Logger::log("Compilation failed for " + module_id + (is_driver ? " (driver)" : "") + ": " + errors);
+        return false;
+    }
+};
+
+// Device Info
+struct DeviceInfo {
+    string bus, vid, pid, device_id, device_class, endpoints, max_packet_size, interface_class, driver_type;
+};
+
+// Driver Pattern Analyzer
+class DriverPatternAnalyzer {
+public:
+    static map<string, vector<string>> analyze_driver_patterns(const string& driver_type) {
+        map<string, vector<string>> patterns;
+        string path;
+        if (driver_type == "usb") path = KERNEL_SRC + "/usb";
+        else if (driver_type == "pci") path = KERNEL_SRC + "/pci";
+        else if (driver_type == "block") path = KERNEL_SRC + "/block";
+        else if (driver_type == "net") path = KERNEL_SRC + "/net";
+        else return patterns;
+
+        if (!fs::exists(path)) {
+            Logger::log("Kernel driver source not found for " + driver_type);
+            return patterns;
+        }
+
+        for (const auto& entry : fs::recursive_directory_iterator(path)) {
+            if (entry.path().extension() == ".c") {
+                ifstream file(entry.path());
+                string content((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+                if (driver_type == "usb") {
+                    if (content.find("struct usb_driver") != string::npos) {
+                        patterns["usb_driver"].push_back(content);
+                    }
+                } else if (driver_type == "pci") {
+                    if (content.find("struct pci_driver") != string::npos) {
+                        patterns["pci_driver"].push_back(content);
+                    }
+                } else if (driver_type == "block") {
+                    if (content.find("struct block_device_operations") != string::npos) {
+                        patterns["block_ops"].push_back(content);
+                    }
+                } else if (driver_type == "net") {
+                    if (content.find("struct net_device_ops") != string::npos) {
+                        patterns["net_ops"].push_back(content);
+                    }
+                }
+            }
+        }
+        Logger::log("Analyzed " + to_string(patterns.size()) + " patterns for " + driver_type);
+        return patterns;
+    }
+
+    static string extract_template(const string& driver_type, const map<string, vector<string>>& patterns) {
+        string template_code;
+        if (driver_type == "usb" && !patterns.at("usb_driver").empty()) {
+            template_code = patterns.at("usb_driver")[0];
+            template_code = regex_replace(template_code, regex("probe\\s*\\([^)]+\\)"), "probe(struct usb_interface *interface, const struct usb_device_id *id)");
+        } else if (driver_type == "pci" && !patterns.at("pci_driver").empty()) {
+            template_code = patterns.at("pci_driver")[0];
+            template_code = regex_replace(template_code, regex("probe\\s*\\([^)]+\\)"), "probe(struct pci_dev *dev, const struct pci_device_id *id)");
+        } else if (driver_type == "block" && !patterns.at("block_ops").empty()) {
+            template_code = patterns.at("block_ops")[0];
+            template_code = regex_replace(template_code, regex("open\\s*\\([^)]+\\)"), "open(struct block_device *bdev, fmode_t mode)");
+        } else if (driver_type == "net" && !patterns.at("net_ops").empty()) {
+            template_code = patterns.at("net_ops")[0];
+            template_code = regex_replace(template_code, regex("open\\s*\\([^)]+\\)"), "open(struct net_device *dev)");
+        }
+        return template_code;
+    }
+};
+
+// RSI Core
+class RSICore {
+private:
+    int iteration = 0;
+    vector<string> improvement_goals;
+    map<string, map<string, int>> module_metrics;
+    vector<json> knowledge_base;
+    map<string, json> modules;
+    map<string, json> code_versions;
+    bool running = true;
+    int sock_fd = -1;
+
+public:
+    RSICore() {
+        fs::create_directories(MODULE_DIR);
+        fs::create_directories(BIN_DIR);
+        fs::create_directories(KNOWLEDGE_DIR);
+        fs::create_directories(DRIVER_DIR);
+        load_modules();
+        load_knowledge_base();
+        seed_initial_kernel();
+        setup_socket();
+    }
+
+    ~RSICore() {
+        if (sock_fd != -1) close(sock_fd);
+        unlink(SOCKET_PATH.c_str());
+    }
+
+    void load_modules() {
+        if (fs::exists(MODULES_FILE)) {
+            ifstream f(MODULES_FILE);
+            modules = json::parse(f);
+        }
+        save_modules();
+    }
+
+    void save_modules() {
+        ofstream f(MODULES_FILE);
+        f << modules.dump(4);
+    }
+
+    void load_knowledge_base() {
+        knowledge_base.clear();
+        for (const auto& entry : fs::directory_iterator(KNOWLEDGE_DIR)) {
+            if (entry.path().extension() == ".kb") {
+                try {
+                    ifstream f(entry.path());
+                    json data = json::parse(f);
+                    knowledge_base.push_back(data);
+                } catch (const exception& e) {
+                    Logger::log("Failed to parse KB file " + entry.path().string() + ": " + e.what());
+                }
+            }
+        }
+        Logger::log("Loaded " + to_string(knowledge_base.size()) + " knowledge entries");
+    }
+
+    string generate_random_id(size_t length = 8) {
+        static const char charset[] = "abcdefghijklmnopqrstuvwxyz";
+        static random_device rd;
+        static mt19937 gen(rd());
+        static uniform_int_distribution<> dist(0, sizeof(charset) - 2);
+        string result;
+        while (result.size() < length) result += charset[dist(gen)];
+        return result;
+    }
+
+    void seed_initial_kernel() {
+        string module_id = generate_random_id();
+        int version = 0;
+        string base_code = R"(#include <linux/module.h>
+#include <linux/kernel.h>
+static int __init rsi_driver_init(void) {
+    printk(KERN_INFO "RSI-Core: Dummy driver loaded\n");
+    return 0;
+}
+static void __exit rsi_driver_exit(void) {
+    printk(KERN_INFO "RSI-Core: Dummy driver unloaded\n");
+}
+module_init(rsi_driver_init);
+module_exit(rsi_driver_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("RSI-Core");
+)";
+        json base_tests = {{"inputs", vector<string>{}}, {"expected", vector<string>{}}};
+        json base_introspection = {
+            {"rules", vector<json>{
+                {{"type", "compile_error"}, {"check", "compile_error"}},
+                {{"type", "load_error"}, {"check", "load_error"}},
+                {{"type", "endpoint_error"}, {"check", "load_error"}},
+                {{"type", "interrupt_error"}, {"check", "load_error"}},
+                {{"type", "symbol_error"}, {"check", "compile_error"}},
+                {{"type", "ioctl_error"}, {"check", "load_error"}}
+            }}
+        };
+        json base_patcher = {
+            {"compile_error", base_code},
+            {"load_error", base_code},
+            {"endpoint_error", base_code},
+            {"interrupt_error", base_code},
+            {"symbol_error", base_code},
+            {"ioctl_error", base_code}
+        };
+        code_versions[module_id] = {
+            {"code", base_code},
+            {"tests", base_tests},
+            {"intelligence", base_introspection},
+            {"patcher", base_patcher},
+            {"version", version},
+            {"name", "dummy_driver"},
+            {"is_driver", true}
+        };
+        modules[module_id] = {{"name", "dummy_driver"}, {"version", version}, {"is_driver", true}};
+        save_modules();
+        knowledge_base.push_back({
+            {"type", "driver"},
+            {"id", module_id},
+            {"name", "dummy_driver"},
+            {"code", base_code},
+            {"timestamp", ""}
+        });
+        ofstream kb_file(KNOWLEDGE_DIR + "/rsi_" + module_id + "_0.kb");
+        kb_file << json(knowledge_base).dump(4);
+    }
+
+    DeviceInfo get_device_info(const string& device_id) {
+        DeviceInfo info;
+        info.device_id = device_id;
+
+        // Determine bus type
+        if (device_id.find("usb") == 0) {
+            info.bus = "usb";
+            info.driver_type = "usb";
+            string cmd = "lsusb -v -d " + device_id.substr(4) + " 2>/dev/null";
+            FILE* pipe = popen(cmd.c_str(), "r");
+            char buffer[256];
+            string output;
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) output += buffer;
+            pclose(pipe);
+            regex vid_pid_regex("idVendor\\s+0x([0-9a-f]{4}).*idProduct\\s+0x([0-9a-f]{4})");
+            regex class_regex("bDeviceClass\\s+([0-9]+)");
+            regex_endpoint_regex("bNumEndpoints\\s+([0-9]+)");
+            regex packet_regex("wMaxPacketSize\\s+0x([0-9a-f]+)");
+            regex iface_regex("bInterfaceClass\\s+([0-9]+)");
+            smatch match;
+            if (regex_search(output, match, vid_pid_regex)) {
+                info.vid = match[1].str();
+                info.pid = match[2].str();
+            } else {
+                info.vid = "1234";
+                info.pid = "5678";
+            }
+            if (regex_search(output, match, class_regex)) {
+                info.device_class = match[1].str();
+            } else {
+                info.device_class = "0";
+            }
+            if (regex_search(output, match, regex_regex)) {
+                info.endpoints = match[1].str();
+            } else {
+                info.endpoints = "1";
+            }
+            if (regex_search(output, match, packet_regex)) {
+                info.max_packet_size = match[1].str();
+            } else {
+                info.max_packet_size = "64";
+            }
+            if (regex_search(output, match, iface_regex)) {
+                info.interface_class = match[1].str();
+            } else {
+                info.interface_class = "0";
+            }
+        } else if (device_id.find("pci") == 0) {
+            info.bus = "pci";
+            info.driver_type = "pci";
+            string cmd = "lspci -vmm -s " + device_id.substr(4) + " 2>/dev/null";
+            FILE* pipe = popen(cmd.c_str(), "r");
+            char buffer[256];
+            string output;
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) output += buffer;
+            pclose(pipe);
+            regex vid_pid_regex("Vendor:\\s+([0-9a-f]{4}).*Device:\\s+([0-9a-f]{4})");
+            regex class_regex("Class:\\s+([0-9a-f]+)");
+            smatch match;
+            if (regex_search(output, match, vid_pid_regex)) {
+                info.vid = match[1].str();
+                info.pid = match[2].str();
+            } else {
+                info.vid = "1234";
+                info.pid = "5678";
+            }
+            if (regex_search(output, match, class_regex)) {
+                info.device_class = match[1].str();
+            } else {
+                info.device_class = "0";
+            }
+            info.endpoints = "0";
+            info.max_packet_size = "0";
+            info.interface_class = "0";
+        } else if (device_id.find("block") == 0) {
+            info.bus = "block";
+            info.driver_type = "block";
+            info.vid = "0000";
+            info.pid = "0000";
+            info.device_class = "8"; // Mass storage
+            info.endpoints = "0";
+            info.max_packet_size = "0";
+            info.interface_class = "0";
+        } else if (device_id.find("net") == 0) {
+            info.bus = "net";
+            info.driver_type = "net";
+            string cmd = "ethtool -i " + device_id.substr(4) + " 2>/dev/null";
+            FILE* pipe = popen(cmd.c_str(), "r");
+            char buffer[256];
+            string output;
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) output += buffer;
+            pclose(pipe);
+            regex driver_regex("driver:\\s+(\\w+)");
+            smatch match;
+            if (regex_search(output, match, driver_regex)) {
+                info.vid = "0000";
+                info.pid = "0000";
+            } else {
+                info.vid = "1234";
+                info.pid = "5678";
+            }
+            info.device_class = "2"; // Communications
+            info.endpoints = "0";
+            info.max_packet_size = "0";
+            info.interface_class = "0";
+        }
+        Logger::log("Probed device " + device_id + ": Bus=" + info.bus + ", VID=" + info.vid + ", PID=" + info.pid + ", Type=" + info.driver_type);
+        return info;
+    }
+
+    void monitor_system() {
+        string cmd = "dmesg | tail -n 50 2>/dev/null";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            string line = buffer;
+            if (line.find("no driver") != string::npos || line.find("device not found") != string::npos || line.find("failed to register") != string::npos) {
+                regex device_regex("(usb[0-9]+-[0-9]+(\\.[0-9]+)*)|(pci[0-9]+:[0-9]+\\.[0-9])|(block[0-9]+)|(net[0-9]+)");
+                smatch match;
+                if (regex_search(line, match, device_regex)) {
+                    string device_id = match[0].str();
+                    if (!device_id.empty() && find(improvement_goals.begin(), improvement_goals.end(), "driver:" + device_id) == improvement_goals.end()) {
+                        improvement_goals.push_back("driver:" + device_id);
+                        Notifications::notify("Driver issue detected for device: " + device_id);
+                    }
+                }
+            }
+        }
+        pclose(pipe);
+        for (const auto& [id, _] : modules) {
+            if (module_metrics[id].empty()) {
+                module_metrics[id] = {{"load_count", 0}, {"error_count", 0}, {"score", 0}, {"mutation_attempts", 0}};
+            }
+        }
+    }
+
+    void start_improvement_cycle() {
+        iteration++;
+        Logger::log("Starting RSI Cycle #" + to_string(iteration));
+        while (!improvement_goals.empty() && iteration < MAX_ITERATIONS) {
+            string goal = improvement_goals.front();
+            improvement_goals.erase(improvement_goals.begin());
+            process_goal(goal);
+        }
+    }
+
+    void process_goal(const string& goal) {
+        auto parts = split(goal, ':');
+        string type = parts[0], target = parts.size() > 1 ? parts[1] : "";
+        if (type == "driver") generate_driver(target);
+        else if (type == "optimize") optimize_module(target);
+    }
+
+    void optimize_module(const string& module_id) {
+        if (code_versions.find(module_id) == code_versions.end()) return;
+        Logger::log("Optimizing module: " + module_id);
+        auto& bundle = code_versions[module_id];
+        auto failures = run_tests(module_id, bundle["is_driver"]);
+        if (failures.empty()) {
+            Logger::log("Module " + module_id + " passed all tests");
+            return;
+        }
+        auto analysis = analyze_failures(failures, bundle["introspection"]);
+        string patched_code = apply_patch(bundle["code"], analysis, bundle["patcher"]);
+        auto new_tests = mutate_tests(bundle["tests"], analysis);
+        auto new_introspection = mutate_introspection(bundle["introspection"], analysis);
+        auto new_patcher = mutate_patcher(bundle["patcher"], analysis, bundle["code"]);
+        store_new_version(module_id, patched_code, new_tests, new_introspection, new_patcher);
+    }
+
+    void generate_driver(const string& device) {
+        Logger::log("Generating driver for device: " + device);
+        string module_id = generate_random_id();
+        string module_name = "driver_" + device;
+        DeviceInfo info = get_device_info(device);
+        auto patterns = DriverPatternAnalyzer::analyze_driver_patterns(info.driver_type);
+        string module_code = generate_driver_code(info, module_id, patterns);
+        code_versions[module_id] = {
+            {"code", module_code},
+            {"tests", json{{"inputs", vector<string>{}}, {"expected", vector<string>{}}}},
+            {"introspection", json{{"rules", vector<json>{
+                {{"type", "compile_error"}, {"check", "compile_error"}},
+                {{"type", "load_error"}, {"check", "load_error"}},
+                {{"type", "endpoint_error"}, {"check", "load_error"}},
+                {{"type", "interrupt_error"}, {"check", "load_error"}},
+                {{"type", "symbol_error"}, {"check", "compile_error"}},
+                {{"type", "ioctl_error"}, {"check", "load_error"}}
+            }}}},
+            {"patcher", json{{"compile_error", module_code}, {"load_error", module_code}, {"endpoint_error", module_code}, {"interrupt_error", module_code}, {"symbol_error", module_code}, {"ioctl_error", module_code}}},
+            {"version", 0},
+            {"name", module_name},
+            {"is_driver", true}
+        };
+        deploy_module(module_id, module_name, module_code, true);
+    }
+
+    string generate_driver_code(const DeviceInfo& info, const string& module_id, const map<string, vector<string>>& patterns) {
+        string template_code = DriverPatternAnalyzer::extract_template(info.driver_type, patterns);
+        string code;
+
+        if (info.driver_type == "usb") {
+            string endpoint_setup;
+            int num_endpoints = info.endpoints.empty() ? 1 : stoi(info.endpoints);
+            for (int i = 0; i < num_endpoints; ++i) {
+                endpoint_setup += "    usb_fill_bulk_urb(&data->urb_" + to_string(i) + ", dev, usb_rcvbulkpipe(dev, " + to_string(i+1) + "), data->buffer_" + to_string(i) + ", " + info.max_packet_size + ", rsi_urb_callback, data);\n";
+            }
+            code = R"(#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/usb.h>
+#include <linux/slab.h>
+
+static struct usb_device_id rsi_table[] = {
+    { USB_DEVICE(0x)" + info.vid + R"(, 0x)" + info.pid + R"() },
+    { }
+};
+MODULE_DEVICE_TABLE(usb, rsi_table);
+
+struct rsi_usb_data {
+    struct usb_device *dev;
+)" + string(num_endpoints > 0 ? "    struct urb *urb_" + to_string(num_endpoints) + ";\n" : "") + string(num_endpoints > 0 ? "    char *buffer_" + to_string(num_endpoints) + ";\n" : "") + R"(};
+
+static void rsi_urb_callback(struct urb *urb) {
+    printk(KERN_INFO "RSI-Core: URB callback for )" + info.device_id + R"(\n");
+}
+
+static int rsi_probe(struct usb_interface *interface, const struct usb_device_id *id) {
+    struct usb_device *dev = interface_to_usbdev(interface);
+    struct rsi_usb_data *data;
+    printk(KERN_INFO "RSI-Core: Probed )" + info.device_id + " (ID: " + module_id + " VID:PID=" + info.vid + ":" + info.pid + R"(\n");
+    data = kzalloc(sizeof(struct rsi_usb_data), GFP_KERNEL);
+    if (!data) return -ENOMEM;
+    data->dev = usb_get_dev(dev);
+)" + endpoint_setup + R"(
+    usb_set_intfdata(interface, data);
+    return 0;
+}
+
+static void rsi_disconnect(struct usb_interface *interface) {
+    struct rsi_usb_data *data = usb_get_intfdata(interface);
+    printk(KERN_INFO "RSI-Core: Disconnected )" + info.device_id + R"(\n");
+    if (data) {
+        usb_put_dev(data->dev);
+        kfree(data);
+    }
+    usb_set_intfdata(interface, NULL);
+}
+
+static struct usb_driver rsi_driver = {
+    .name = "rsi_)" + module_id + R"(",
+    .id_table = rsi_table,
+    .probe = rsi_probe,
+    .disconnect = rsi_disconnect,
+};
+
+static int __init rsi_driver_init(void) {
+    return usb_register(&rsi_driver);
+}
+
+static void __exit rsi_driver_exit(void) {
+    usb_deregister(&rsi_driver);
+}
+
+module_init(rsi_driver_init);
+module_exit(rsi_driver_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("RSI-Core");
+MODULE_DESCRIPTION("RSI-Core USB driver for )" + info.device_id + R"(");
+)";
+        } else if (info.driver_type == "pci") {
+            code = R"(#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/pci.h>
+#include <linux/slab.h>
+
+static struct pci_device_id rsi_table[] = {
+    { PCI_DEVICE(0x)" + info.vid + R"(, 0x)" + info.pid + R"() },
+    { }
+};
+MODULE_DEVICE_TABLE(pci, rsi_table);
+
+struct rsi_pci_data {
+    struct pci_dev *dev;
+};
+
+static int rsi_probe(struct pci_dev *dev, const struct pci_device_id *id) {
+    struct rsi_pci_data *data;
+    printk(KERN_INFO "RSI-Core: Probed )" + info.device_id + " (ID: " + module_id + " VID:PID=" + info.vid + ":" + info.pid + R"(\n");
+    data = kzalloc(sizeof(struct rsi_pci_data), GFP_KERNEL);
+    if (!data) return -ENOMEM;
+    data->dev = dev;
+    pci_enable_device(dev);
+    return 0;
+}
+
+static void rsi_remove(struct pci_dev *dev) {
+    struct rsi_pci_data *data = pci_get_drvdata(dev);
+    printk(KERN_INFO "RSI-Core: Removed )" + info.device_id + R"(\n");
+    if (data) kfree(data);
+    pci_disable_device(dev);
+}
+
+static struct pci_driver rsi_driver = {
+    .name = "rsi_)" + module_id + R"(",
+    .id_table = rsi_table,
+    .probe = rsi_probe,
+    .remove = rsi_remove,
+};
+
+static int __init rsi_driver_init(void) {
+    return pci_register_driver(&rsi_driver);
+}
+
+static void __exit rsi_driver_exit(void) {
+    pci_unregister_driver(&rsi_driver);
+}
+
+module_init(rsi_driver_init);
+module_exit(rsi_driver_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("RSI-Core");
+MODULE_DESCRIPTION("RSI-Core PCI driver for )" + info.device_id + R"(");
+)";
+        } else if (info.driver_type == "block") {
+            code = R"(#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/blkdev.h>
+#include <linux/slab.h>
+
+struct rsi_block_data {
+    struct gendisk *disk;
+    struct request_queue *queue;
+};
+
+static int rsi_open(struct block_device *bdev, fmode_t mode) {
+    printk(KERN_INFO "RSI-Core: Opened block device )" + info.device_id + R"(\n");
+    return 0;
+}
+
+static void rsi_release(struct gendisk *disk, fmode_t mode) {
+    printk(KERN_INFO "RSI-Core: Released block device )" + info.device_id + R"(\n");
+}
+
+static struct block_device_operations rsi_ops = {
+    .owner = THIS_MODULE,
+    .open = rsi_open,
+    .release = rsi_release,
+};
+
+static int __init rsi_driver_init(void) {
+    struct rsi_block_data *data;
+    printk(KERN_INFO "RSI-Core: Loading block driver for )" + info.device_id + R"(\n");
+    data = kzalloc(sizeof(struct rsi_block_data), GFP_KERNEL);
+    if (!data) return -ENOMEM;
+    data->queue = blk_alloc_queue(GFP_KERNEL);
+    if (!data->queue) {
+        kfree(data);
+        return -ENOMEM;
+    }
+    data->disk = alloc_disk(1);
+    if (!data->disk) {
+        blk_cleanup_queue(data->queue);
+        kfree(data);
+        return -ENOMEM;
+    }
+    data->disk->queue = data->queue;
+    data->disk->fops = &rsi_ops;
+    add_disk(data->disk);
+    return 0;
+}
+
+static void __exit rsi_driver_exit(void) {
+    printk(KERN_INFO "RSI-Core: Unloaded block driver for )" + info.device_id + R"(\n");
+}
+
+module_init(rsi_driver_init);
+module_exit(rsi_driver_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("RSI-Core");
+MODULE_DESCRIPTION("RSI-Core block driver for )" + info.device_id + R"(");
+)";
+        } else if (info.driver_type == "net") {
+            code = R"(#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/netdevice.h>
+#include <linux/slab.h>
+
+struct rsi_net_data {
+    struct net_device *dev;
+};
+
+static int rsi_net_open(struct net_device *dev) {
+    printk(KERN_INFO "RSI-Core: Opened net device )" + info.device_id + R"(\n");
+    netif_start_queue(dev);
+    return 0;
+}
+
+static int rsi_net_stop(struct net_device *dev) {
+    printk(KERN_INFO "RSI-Core: Stopped net device )" + info.device_id + R"(\n");
+    netif_stop_queue(dev);
+    return 0;
+}
+
+static struct net_device_ops rsi_net_ops = {
+    .ndo_open = rsi_net_open,
+    .ndo_stop = rsi_net_stop,
+};
+
+static int __init rsi_driver_init(void) {
+    struct rsi_net_data *data;
+    struct net_device *dev;
+    printk(KERN_INFO "RSI-Core: Loading net driver for )" + info.device_id + R"(\n");
+    data = kzalloc(sizeof(struct rsi_net_data), GFP_KERNEL);
+    if (!data) return -ENOMEM;
+    dev = alloc_netdev(sizeof(struct net_device), "rsi_net%d", NET_NAME_UNKNOWN, ether_setup);
+    if (!dev) {
+        kfree(data);
+        return -ENOMEM;
+    }
+    data->dev = dev;
+    dev->netdev_ops = &rsi_net_ops;
+    register_netdev(dev);
+    return 0;
+}
+
+static void __exit rsi_driver_exit(void) {
+    printk(KERN_INFO "RSI-Core: Unloaded net driver for )" + info.device_id + R"(\n");
+}
+
+module_init(rsi_driver_init);
+module_exit(rsi_driver_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("RSI-Core");
+MODULE_DESCRIPTION("RSI-Core net driver for )" + info.device_id + R"(");
+)";
+        } else {
+            code = R"(#include <linux/module.h>
+#include <linux/kernel.h>
+static int __init rsi_driver_init(void) {
+    printk(KERN_INFO "RSI-Core: Dummy driver for )" + info.device_id + R"(\n");
+    return 0;
+}
+static void __exit rsi_driver_exit(void) {
+    printk(KERN_INFO "RSI-Core: Unloaded dummy driver\n");
+}
+module_init(rsi_driver_init);
+module_exit(rsi_driver_exit);
+MODULE_LICENSE("GPL");
+)";
+        }
+
+        knowledge_base.push_back({
+            {"type", "driver"},
+            {"id", module_id},
+            {"name", "driver_" + info.device_id},
+            {"device_info", {{"bus", info.bus}, {"vid", info.vid}, {"pid", info.pid}, {"class", info.device_class}, {"endpoints", info.endpoints}, {"max_packet_size", info.max_packet_size}, {"interface_class", info.interface_class}, {"driver_type", info.driver_type}}},
+            {"timestamp", ""}
+        });
+        return code;
+    }
+
+    vector<json> run_tests(const string& module_id, bool is_driver) {
+        auto& bundle = code_versions[module_id];
+        if (!Compiler::compile(module_id, bundle["code"], is_driver)) {
+            string cmd = "cat /tmp/rsi_compile_log_" + module_id + " 2>/dev/null";
+            FILE* pipe = popen(cmd.c_str(), "r");
+            char buffer[256];
+            string errors;
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) errors += buffer;
+            pclose(pipe);
+            return {{{"input", nullptr}, {"reason", "compile_error"}, {"error", errors}}};
+        }
+        if (is_driver) {
+            string driver_path = DRIVER_DIR + "/" + module_id + ".ko";
+            string cmd = "insmod " + driver_path + " 2>&1";
+            FILE* pipe = popen(cmd.c_str(), "r");
+            char buffer[256];
+            string output;
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) output += buffer;
+            int status = pclose(pipe);
+            if (status != 0) {
+                return {{{"input", nullptr}, {"reason", "load_error"}, {"error", output}}};
+            }
+            cmd = "dmesg | tail -n 100";
+            pipe = popen(cmd.c_str(), "r");
+            string dmesg_output;
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) dmesg_output += buffer;
+            pclose(pipe);
+            if (dmesg_output.find("oops") != string::npos || dmesg_output.find("panic") != string::npos) {
+                return {{{"input", nullptr}, {"reason", "load_error"}, {"error", dmesg_output}}};
+            }
+            system(("rmmod " + module_id + " 2>/dev/null").c_str());
+        }
+        return {};
+    }
+
+    vector<json> analyze_failures(const vector<json>& failures, const json& introspection) {
+        vector<json> analysis;
+        for (const auto& failure : failures) {
+            string error = failure["error"].get<string>();
+            for (const auto& rule : introspection["rules"]) {
+                if (rule["check"] == failure["reason"]) {
+                    json a = {{"type", rule["type"]}};
+                    if (rule["type"] == "endpoint_error" && error.find("invalid endpoint") != string::npos) {
+                        a["fix"] = "adjust_endpoints";
+                        regex ep_regex("endpoint.*([0-9]+)");
+                        smatch match;
+                        if (regex_search(error, match, ep_regex)) a["endpoint"] = match[1].str();
+                    } else if (rule["type"] == "interrupt_error" && error.find("invalid interrupt") != string::npos) {
+                        a["fix"] = "add_interrupt";
+                    } else if (rule["type"] == "symbol_error" && error.find("undefined symbol") != string::npos) {
+                        a["fix"] = "resolve_symbol";
+                        regex symbol_regex("undefined symbol: ([a-zA-Z_]+)");
+                        smatch match;
+                        if (regex_search(error, match, symbol_regex)) a["symbol"] = match[1].str();
+                    } else if (rule["type"] == "ioctl_error" && error.find("ioctl") != string::npos) {
+                        a["fix"] = "add_ioctl";
+                    }
+                    for (const auto& [k, v] : failure.items()) a[k] = v;
+                    analysis.push_back(a);
+                }
+            }
+        }
+        if (analysis.empty()) {
+            for (const auto& f : failures) {
+                json a = {{"type", "unknown"}};
+                for (const auto& [k, v] : f.items()) a[k] = v;
+                analysis.push_back(a);
+            }
+        }
+        return analysis;
+    }
+
+    string apply_patch(const string& code, const vector<json>& analysis, const json& patcher, const string& driver_type = "") {
+        string new_code = code;
+        for (const auto& issue : analysis) {
+            if (issue["type"] == "endpoint_error" && issue.contains("fix") && issue["fix"] == "adjust_endpoints") {
+                int endpoints = issue.contains("endpoint") ? max(1, stoi(issue["endpoint"].get<string>()) - 1) : 1;
+                new_code = regex_replace(new_code, regex("bNumEndpoints\\s+[0-9]+"), "bNumEndpoints " + to_string(endpoints));
+                Logger::log("Patched endpoints to " + to_string(endpoints));
+            } else if (issue["type"] == "interrupt_error" && issue.contains("fix") && issue["fix"] == "add_interrupt") {
+                string interrupt_code = R"(
+static irqreturn_t rsi_interrupt_handler(int irq, void *dev_id) {
+    printk(KERN_INFO "RSI-Core: Interrupt handled\n");
+    return IRQ_HANDLED;
+}
+)";
+                new_code = regex_replace(new_code, regex("#include <linux/slab.h>"), "#include <linux/slab.h>\n#include <linux/interrupt.h>");
+                new_code = regex_replace(new_code, regex("static int rsi_probe\\(struct usb_interface \\*interface, const struct usb_device_id \\*id\\) \\{"),
+                    interrupt_code + "\nstatic int rsi_probe(struct usb_interface *interface, const struct usb_device_id *id) {");
+                new_code += "\n    request_irq(dev->irq, rsi_interrupt_handler, IRQF_SHARED, \"rsi\", dev);\n";
+                Logger::log("Added interrupt handler");
+            } else if (issue["type"] == "symbol_error" && issue.contains("fix") && issue.contains("symbol")) {
+                string symbol = issue["symbol"].get<string>();
+                string cmd = "nm /lib/modules/$(uname -r)/build/vmlinux | grep " + symbol + " 2>/dev/null";
+                FILE* pipe = popen(cmd.c_str(), "r");
+                char buffer[256];
+                string output;
+                while (fgets(buffer, sizeof(buffer), pipe) != nullptr) output += buffer;
+                pclose(pipe);
+                if (!output.empty()) {
+                    new_code = "#include <linux/" + symbol + ".h>\n" + new_code;
+                    Logger::log("Added include for symbol " + symbol);
+                } else {
+                    new_code = regex_replace(new_code, regex(symbol + "\\s*\\("), "/* " + symbol + " */ ");
+                    Logger::log("Commented out use of undefined symbol " + symbol);
+                }
+            } else if (issue["type"] == "ioctl_error" && issue.contains("fix") && issue["fix"] == "add_ioctl") {
+                string ioctl_code = R"(
+static long rsi_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    printk(KERN_INFO "RSI-Core: IOCTL called\n");
+    return 0;
+}
+)";
+                new_code = regex_replace(new_code, regex("static struct block_device_operations rsi_ops = \\{"),
+                    ioctl_code + "\nstatic struct block_device_operations rsi_ops = {");
+                new_code = regex_replace(new_code, regex("\\.release\\s*=\\s*rsi_release"),
+                    ".release = rsi_release, .unlocked_ioctl = rsi_ioctl");
+                Logger::log("Added ioctl handler");
+            } else if (issue["type"] == "compile_error") {
+                regex syntax_regex("error: (.*) at line ([0-9]+)");
+                smatch match;
+                string error = issue["error"].get<string>();
+                if (regex_search(error, match, syntax_regex)) {
+                    int line_num = stoi(match[2].str());
+                    vector<string> lines;
+                    stringstream ss(new_code);
+                    string line;
+                    int i = 1;
+                    while (getline(ss, line)) {
+                        if (i == line_num && (line.find("urb_") != string::npos || line.find("ioctl") != string::npos)) {
+                            line = "// " + line + " // Disabled due to compile error";
+                        }
+                        lines.push_back(line);
+                        i++;
+                    }
+                    new_code = "";
+                    for (const auto& l : lines) new_code += l + "\n";
+                    Logger::log("Commented out line " + to_string(line_num) + " due to compile error");
+                }
+            } else if (patcher.contains(issue["type"])) {
+                new_code = patcher[issue["type"]];
+                Logger::log("Applied default patch for " + issue["type"].get<string>());
+            }
+        }
+        return new_code;
+    }
+
+    json mutate_tests(const json& tests, const vector<json>& analysis) {
+        json new_tests = tests;
+        for (const auto& issue : analysis) {
+            if (issue["type"] == "endpoint_error") {
+                new_tests["inputs"].push_back("test_endpoint");
+                new_tests["expected"].push_back("success");
+            } else if (issue["type"] == "interrupt_error") {
+                new_tests["inputs"].push_back("test_interrupt");
+                new_tests["expected"].push_back("IRQ_HANDLED");
+            } else if (issue["type"] == "ioctl_error") {
+                new_tests["inputs"].push_back("test_ioctl");
+                new_tests["expected"].push_back("0");
+            }
+        }
+        return new_tests;
+    }
+
+    json mutate_introspection(const json& introspection, const vector<json>& analysis) {
+        json new_rules = introspection["rules"];
+        for (const auto& issue : analysis) {
+            if (issue["type"] == "unknown") {
+                string error = issue["error"].get<string>();
+                if (error.find("invalid endpoint") != string::npos) {
+                    new_rules.push_back({{"type", "endpoint_error"}, {"check", "load_error"}});
+                } else if (error.find("invalid interrupt") != string::npos) {
+                    new_rules.push_back({{"type", "interrupt_error"}, {"check", "load_error"}});
+                } else if (error.find("undefined symbol") != string::npos) {
+                    new_rules.push_back({{"type", "symbol_error"}, {"check", "compile_error"}});
+                } else if (error.find("ioctl") != string::npos) {
+                    new_rules.push_back({{"type", "ioctl_error"}, {"check", "load_error"}});
+                }
+            }
+        }
+        return {{"rules", new_rules}};
+    }
+
+    json mutate_patcher(const json& patcher, const string& original_code, const string& driver_type) {
+        json new_patcher = patcher;
+        for (const auto& issue : analysis) {
+            if (issue["type"] == "unknown") {
+                string error = issue["error"].get<string>();
+                if (error.find("invalid endpoint") != string::npos) {
+                    new_patcher["endpoint_error"] = apply_patch(original_code, {issue}, patcher, driver_type);
+                } else if (error.find("invalid interrupt") != string::npos) {
+                    new_patcher["interrupt_error"] = apply_patch(original_code, {issue}, patcher, driver_type);
+                } else if (error.find("undefined symbol") != string::npos) {
+                    new_patcher["symbol_error"] = apply_patch(original_code, {issue}, patcher, driver_type);
+                } else if (error.find("ioctl") != string::npos) {
+                    new_patcher["ioctl_error"] = apply_patch(original_code, {issue}, patcher, driver_type);
+                } else {
+                    new_patcher["unknown"] = original_code;
+                }
+            }
+        }
+        return new_patcher;
+    }
+
+    void store_new_version(const string& module_id, const string& code, const json& tests, const json& introspection, const json& patcher) {
+        int version = code_versions[module_id]["version"].get<int>() + 1;
+        code_versions[module_id] = {
+            {"code", code},
+            {"tests", tests},
+            {"introspection", introspection},
+            {"patcher", patcher},
+            {"version", version},
+            {"name", code_versions[module_id]["name"]},
+            {"is_driver", true}
+        };
+        modules[module_id]["version"] = version;
+        save_modules();
+        knowledge_base.push_back({
+            {"type", "driver"},
+            {"id", module_id},
+            {"version", version},
+            {"code", code},
+            {"timestamp", "" }
+        });
+        ofstream kb_file(KNOWLEDGE_DIR + "/rsi_" + module_id + "_" + to_string(version) + ".kb");
+        kb_file << json(knowledge_base).dump(4);
+        Logger::log("Stored new version " + to_string(version) + " for module " + module_id);
+        deploy_module(module_id, modules[module_id]["name"], code, true);
+    }
+
+    void deploy_module(const string& module_id, const string& module_name, const string& code, bool is_driver) {
+        try {
+            system(("rsi-snapshotd create snap_" + module_id + " 'Before deploying " + module_name + "'").c_str());
+            if (module_metrics[module_id]["mutation_attempts"] >= MAX_ATTEMPTS) {
+                Logger::log("Aborted deployment for " + module_id + ": max mutation attempts reached");
+                return;
+            }
+            if (Compiler::compile(module_id, code, is_driver)) {
+                auto failures = run_tests(module_id, is_driver);
+                module_metrics[module_id]["load_count"]++;
+                module_metrics[module_id]["error_count"] += failures.size();
+                module_metrics[module_id]["score"] = failures.empty() ? 100 : max(0, 100 - (int)failures.size() * 10);
+                save_modules();
+                Logger::log("Module " + module_name + " (ID: " + module_id + ") deployed successfully");
+                if (!failures.empty()) {
+                    module_metrics[module_id]["mutation_attempts"]++;
+                    improvement_goals.insert(improvement_goals.begin(), "optimize:" + module_id);
+                }
+            } else {
+                module_metrics[module_id]["mutation_attempts"]++;
+                improvement_goals.insert(improvement_goals.begin(), "optimize:" + module_id);
+                throw runtime_error("Compilation failed");
+            }
+        } catch (const exception& e) {
+            Logger::log("Deployment failed for " + module_id + ": " + e.what());
+            module_metrics[module_id]["mutation_attempts"]++;
+            improvement_goals.insert(improvement_goals.begin(), "optimize:" + module_id);
+        }
+    }
+
+    void setup_socket() {
+        sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock_fd == -1) {
+            Logger::log("Socket creation failed");
+            return;
+        }
+        sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, SOCKET_PATH.c_str(), sizeof(addr.sun_path) - 1);
+        unlink(SOCKET_PATH.c_str());
+        if (bind(sock_fd, (sockaddr*)&addr, sizeof(addr)) == -1) {
+            Logger::log("Socket bind failed");
+            close(sock_fd);
+            sock_fd = -1;
+            return;
+        }
+        if (listen(sock_fd, 5) == -1) {
+            Logger::log("Socket listen failed");
+            close(sock_fd);
+            sock_fd = -1;
+            return;
+        }
+        thread([this]() { handle_commands(); }).detach();
+    }
+
+    void handle_commands() {
+        while (running) {
+            int client_fd = accept(sock_fd, nullptr, nullptr);
+            if (client_fd == -1) continue;
+            char buffer[256];
+            int bytes = read(client_fd, buffer, sizeof(buffer) - 1);
+            if (bytes > 0) {
+                buffer[bytes] = '\0';
+                string cmd(buffer);
+                string response;
+                if (cmd.find("rsi-core goal:") == 0) {
+                    string goal = cmd.substr(14);
+                    improvement_goals.push_back(goal);
+                    Notifications::notify("Added goal: " + goal);
+                    response = "Goal added: " + goal + "\n";
+                } else if (cmd.find("rsi-core driver-explain:") == 0) {
+                    string driver_id = cmd.substr(24);
+                    response = explain_driver(driver_id);
+                } else {
+                    response = "Invalid command\n";
+                }
+                write(client_fd, response.c_str(), response.size());
+            }
+            close(client_fd);
+        }
+    }
+
+    string explain_driver(const string& module_id) {
+        if (code_versions.find(module_id) == code_versions.end()) {
+            return "Driver " + module_id + " not found\n";
+        }
+        auto& bundle = code_versions[module_id];
+        if (!bundle["is_driver"]) {
+            return module_id + " is not a driver\n";
+        }
+        string response = "Driver: " + bundle["name"].get<string>() + " (ID: " + module_id + ")\n";
+        response += "Version: " + to_string(bundle["version"].get<int>()) + "\n";
+        response += "Device: " + bundle["name"].get<string>().substr(7) + "\n";
+        for (const auto& kb : knowledge_base) {
+            if (kb["id"] == module_id && kb["type"] == "driver") {
+                response += "Bus: " + kb["device_info"]["bus"].get<string>() + "\n";
+                response += "VID:PID: " + kb["device_info"]["vid"].get<string>() + ":" + kb["device_info"]["pid"].get<string>() + "\n";
+                response += "Class: " + kb["device_info"]["class"].get<string>() + "\n";
+                response += "Type: " + kb["device_info"]["driver_type"].get<string>() + "\n";
+                break;
+            }
+        }
+        response += "Status: " + (module_metrics[module_id]["error_count"] == 0 ? "Stable" : "Issues detected") + "\n";
+        response += "Mutations: " + to_string(module_metrics[module_id]["mutation_attempts"]) + " attempts\n";
+        return response;
+    }
+
+    void run() {
+        Logger::log("Initializing RSI-Core");
+        thread([this]() {
+            while (running && iteration < MAX_ITERATIONS) {
+                monitor_system();
+                start_improvement_cycle();
+                this_thread::sleep_for(chrono::seconds(SLEEP_TIME));
+            }
+        }).detach();
+        while (running) {
+            this_thread::sleep_for(chrono::seconds(1));
+        }
+    }
+
+    void stop() { running = false; }
+
+private:
+    vector<string> split(const string& s, char delim) {
+        vector<string> result;
+        stringstream ss(s);
+        string item;
+        while (getline(ss, item, delim)) result.push_back(item);
+        return result;
+    }
+};
+
+// Signal handler
+RSICore* core = nullptr;
+void signal_handler(int sig) {
+    if (core) core->stop();
+    exit(0);
+}
+
+int main() {
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    core = new RSICore();
+    core->run();
+    delete core;
+    return 0;
+}
